@@ -1,0 +1,197 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Helmet Detection</title>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@latest/dist/tf.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@teachablemachine/image@latest/dist/teachablemachine-image.min.js"></script>
+    <style>
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; text-align: center; background: #f0f2f5; margin: 0; padding: 20px; }
+        .container { max-width: 400px; margin: auto; background: white; padding: 20px; border-radius: 16px; box-shadow: 0 4px 12px rgba(0,0,0,0.1); }
+        #webcam-container { margin: 15px 0; overflow: hidden; border-radius: 12px; background: #000; display: flex; justify-content: center; align-items: center; }
+        #webcam-container canvas { width: 100% !important; height: auto !important; max-width: 320px; }
+        .btn { background: #007bff; color: white; border: none; padding: 14px 24px; font-size: 16px; font-weight: bold; border-radius: 8px; cursor: pointer; width: 100%; }
+        #status-box { font-size: 18px; font-weight: bold; margin-top: 15px; padding: 12px; border-radius: 8px; background: #e9ecef; }
+        .alert { background: #ffe3e3 !important; color: #dc3545 !important; border: 1px solid #dc3545; }
+        .safe { background: #d4edda !important; color: #28a745 !important; border: 1px solid #28a745; }
+        .idle { background: #e2e3e5 !important; color: #383d41 !important; }
+        #log-count { margin-top: 10px; font-size: 14px; color: #6c757d; }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <h2>Helmet Detection</h2>
+    <div id="webcam-container"></div>
+    <button class="btn" id="start-btn" onclick="init()">เปิดกล้องและเริ่มระบบ</button>
+    <div id="status-box">กดปุ่มเพื่อเริ่มทำงาน</div>
+    <div id="log-count">บันทึกภาพไปแล้ว: 0 ภาพ</div>
+</div>
+
+<audio id="alarm" src="https://actions.google.com/sounds/v1/alarms/beep_short.ogg" preload="auto"></audio>
+
+<script>
+    const URL = "https://teachablemachine.withgoogle.com/models/RXfKDw0vFY/"; 
+
+    let model, webcam, maxPredictions;
+    let alarmSound = document.getElementById("alarm");
+
+    let lastCaptureTime = 0;
+    let captureCount = 0;
+    const CAPTURE_COOLDOWN = 10000;
+
+    let prevFrameCtx = null;
+    let prevFrameCanvas = null;
+    let lastMotionTime = 0; 
+    const HOLD_STATE_DURATION = 3000;
+
+    async function init() {
+        const statusBox = document.getElementById("status-box");
+        const startBtn = document.getElementById("start-btn");
+        startBtn.disabled = true;
+        statusBox.innerText = "กำลังขอสิทธิ์ใช้งานกล้องและโหลดโมเดล...";
+
+        // ปลดล็อกการเล่นเสียง Alarm บน iOS/Android
+        alarmSound.play().then(() => {
+            alarmSound.pause();
+            alarmSound.currentTime = 0;
+        }).catch(() => {});
+
+        try {
+            model = await tmImage.load(URL + "model.json", URL + "metadata.json");
+            maxPredictions = model.getTotalClasses();
+
+            // ตั้งค่ากล้องรองรับอุปกรณ์เคลื่อนที่
+            const flip = false;
+            webcam = new tmImage.Webcam(320, 320, flip);
+            
+            // ขอ permission กล้อง
+            await webcam.setup({ facingMode: "environment" });
+            await webcam.play();
+            
+            const webcamContainer = document.getElementById("webcam-container");
+            webcamContainer.innerHTML = "";
+            webcamContainer.appendChild(webcam.canvas);
+
+            prevFrameCanvas = document.createElement('canvas');
+            prevFrameCanvas.width = 320;
+            prevFrameCanvas.height = 320;
+            prevFrameCtx = prevFrameCanvas.getContext('2d');
+
+            statusBox.innerText = "ระบบพร้อมทำงานแล้ว";
+            window.requestAnimationFrame(loop);
+        } catch (err) {
+            console.error(err);
+            statusBox.innerText = "เกิดข้อผิดพลาด: ไม่สามารถเปิดกล้องหรือโหลดโมเดลได้ (โปรดตรวจสอบการอนุญาตกล้องและ HTTPS)";
+            startBtn.disabled = false;
+        }
+    }
+
+    async function loop() {
+        webcam.update();
+        
+        const isMoving = detectMotion();
+        const currentTime = Date.now();
+        const statusBox = document.getElementById("status-box");
+
+        if (isMoving) {
+            lastMotionTime = currentTime;
+        }
+
+        if (currentTime - lastMotionTime < HOLD_STATE_DURATION && lastMotionTime !== 0) {
+            await predict();
+        } else {
+            statusBox.innerHTML = `Waiting 💤`;
+            statusBox.className = "idle";
+        }
+
+        window.requestAnimationFrame(loop);
+    }
+
+    function detectMotion() {
+        const currentCtx = webcam.canvas.getContext('2d');
+        const currentData = currentCtx.getImageData(0, 0, 320, 320).data;
+        
+        if (!prevFrameCtx.hasData) {
+            prevFrameCtx.putImageData(currentCtx.getImageData(0, 0, 320, 320), 0, 0);
+            prevFrameCtx.hasData = true;
+            return false;
+        }
+
+        const prevData = prevFrameCtx.getImageData(0, 0, 320, 320).data;
+        let diffCount = 0;
+
+        for (let i = 0; i < currentData.length; i += 16) {
+            const rDiff = Math.abs(currentData[i] - prevData[i]);
+            const gDiff = Math.abs(currentData[i+1] - prevData[i+1]);
+            const bDiff = Math.abs(currentData[i+2] - prevData[i+2]);
+
+            if (rDiff + gDiff + bDiff > 150) {
+                diffCount++;
+            }
+        }
+
+        prevFrameCtx.putImageData(currentCtx.getImageData(0, 0, 320, 320), 0, 0);
+        return diffCount > 35;
+    }
+
+    async function predict() {
+        const prediction = await model.predict(webcam.canvas);
+        let noHelmetProb = 0;
+        let wearingHelmetProb = 0;
+
+        for (let i = 0; i < maxPredictions; i++) {
+            const className = prediction[i].className.trim().toLowerCase();
+            if (className === "no helmet") {
+                noHelmetProb = prediction[i].probability;
+            } else if (className === "wearing helmet" || className === "helmet") {
+                wearingHelmetProb = prediction[i].probability;
+            }
+        }
+
+        const statusBox = document.getElementById("status-box");
+        const currentTime = Date.now();
+
+        if (noHelmetProb > 0.8) {
+            statusBox.innerHTML = `No Helmet ⚠️ (${(noHelmetProb * 100).toFixed(0)}%)`;
+            statusBox.className = "alert";
+            
+            if (alarmSound.paused) {
+                alarmSound.play().catch(() => {});
+            }
+
+            if (currentTime - lastCaptureTime > CAPTURE_COOLDOWN) {
+                captureSnapshot();
+                lastCaptureTime = currentTime;
+            }
+        } else if (wearingHelmetProb > 0.8) {
+            statusBox.innerHTML = `Wearing Helmet ✅ (${(wearingHelmetProb * 100).toFixed(0)}%)`;
+            statusBox.className = "safe";
+        } else {
+            statusBox.innerHTML = `Waiting 💤`;
+            statusBox.className = "idle";
+        }
+    }
+
+    function captureSnapshot() {
+        const canvas = webcam.canvas;
+        const imageBase64 = canvas.toDataURL("image/jpeg");
+        
+        const now = new Date();
+        const timestamp = now.toISOString().replace(/[:.]/g, "-");
+        const fileName = `no-helmet_${timestamp}.jpg`;
+
+        const a = document.createElement("a");
+        a.href = imageBase64;
+        a.download = fileName;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+
+        captureCount++;
+        document.getElementById("log-count").innerText = `บันทึกภาพไปแล้ว: ${captureCount} ภาพ`;
+    }
+</script>
+</body>
+</html>
